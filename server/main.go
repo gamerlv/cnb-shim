@@ -18,10 +18,16 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var GHToken string = ""
+
 func main() {
 	var conf config.Config
 	config.LoadConfig(&conf)
 	rollrus.SetupLogging(conf.RollbarAccessToken, conf.RollbarEnvironment)
+
+	if (conf.GHToken != "") {
+		GHToken = conf.GHToken + ":@"
+	}
 
 	r := mux.NewRouter()
 	r.HandleFunc("/v1/{namespace}/{name}", NameHandler)
@@ -125,13 +131,31 @@ func NameHandler(w http.ResponseWriter, r *http.Request) {
 	bp, err = downloadBuildpack(url)
 	if err != nil {
 		log.Error(err)
-		w.WriteHeader(http.StatusBadRequest)
-		return
+
+		url := fmt.Sprintf("https://%sgithub.com/%s/archive/master.tar.gz", GHToken, id)
+		log.Infof("at=GH_download file=%s url=%s", shimmedBuildpack, url)
+		bp, err = downloadBuildpack(url)
+
+		if err != nil {
+			log.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+	handlePanic(err)
+
+	// Check if the downloaded tar contains a top level dir
+	log.Infof("at=tar-check file=%s target_dir=%s", shimmedBuildpack, target_dir)
+	tarCheck := fmt.Sprintf(`tar -tf %s | head -n 1 | grep -qF "./"`, bp)
+	_, err = exec.Command("bash", "-c", tarCheck).Output()
+
+	tarStripLevel := 0
+	if err != nil {
+		tarStripLevel = 1
 	}
 
-	handlePanic(err)
-	log.Infof("at=tar file=%s target_dir=%s", shimmedBuildpack, target_dir)
-	tar := fmt.Sprintf(`tar xzf %s -C %s`, bp, target_dir)
+	log.Infof("at=tar file=%s target_dir=%s strip=%d", shimmedBuildpack, target_dir, tarStripLevel)
+	tar := fmt.Sprintf(`tar xzf %s -C %s --strip-components=%d`, bp, target_dir, tarStripLevel)
 	_, err = exec.Command("bash", "-c", tar).Output()
 	handlePanic(err)
 	handlePanic(os.Remove(bp))
@@ -183,6 +207,7 @@ func downloadBuildpack(url string) (string, error) {
 	}
 
 	if resp.StatusCode >= 400 {
+		handlePanic(os.Remove(file.Name()))
 		return "", fmt.Errorf("Failed to download buildpack %s (Status: %s)", url, resp.Status)
 	}
 
